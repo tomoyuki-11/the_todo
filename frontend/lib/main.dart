@@ -4,23 +4,78 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:google_mobile_ads/google_mobile_ads.dart';
 import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:uuid/uuid.dart';
+import 'package:universal_html/html.dart' as html;
 
 // 1. Rustの /todos と対応するモデル
 class Todo {
-  final int id;
+  final String? id; // ← int じゃなくて String? にする
   final String title;
   final bool done;
 
   Todo({required this.id, required this.title, required this.done});
 
-  // JSON → Todo に変換するコンストラクタ
   factory Todo.fromJson(Map<String, dynamic> json) {
+    // MongoDB の _id は { "_id": { "$oid": "xxxxx" } } という形
+    String? id;
+
+    final rawId = json['_id']; // id じゃなくて _id を見る
+    if (rawId is Map<String, dynamic>) {
+      final oid = rawId[r'$oid'];
+      if (oid is String) {
+        id = oid;
+      }
+    } else if (rawId is String) {
+      // とりあえず保険（もし文字列で返ってきた場合）
+      id = rawId;
+    }
+
     return Todo(
-      id: json['id'] as int,
+      id: id,
       title: json['title'] as String,
       done: json['done'] as bool,
     );
   }
+
+  Map<String, dynamic> toJson() {
+    // 新規作成時は _id は送らなくてOK（サーバー側で自動採番）
+    return {'title': title, 'done': done};
+  }
+}
+
+// ★ Rust API のベースURL
+const String _baseUrl =
+    kIsWeb
+        ? 'http://127.0.0.1:3000' // Web のとき（Chrome）
+        : 'http://192.168.0.188:3000';
+
+final _uuid = Uuid();
+
+Future<String> _getOrCreateUserId() async {
+  if (kIsWeb) {
+    // --- Webの場合：localStorageに永続保存 ---
+    final stored = html.window.localStorage['user_id'];
+    if (stored != null && stored.isNotEmpty) {
+      return stored;
+    }
+
+    final newId = _uuid.v4();
+    html.window.localStorage['user_id'] = newId;
+    return newId;
+  }
+
+  // --- スマホ/PC（通常のSharedPreferences） ---
+  final prefs = await SharedPreferences.getInstance();
+  final existing = prefs.getString('user_id');
+
+  if (existing != null && existing.isNotEmpty) {
+    return existing;
+  }
+
+  final newId = _uuid.v4();
+  await prefs.setString('user_id', newId);
+  return newId;
 }
 
 void main() {
@@ -119,15 +174,26 @@ class _TodoPageState extends State<TodoPage> {
     });
 
     try {
-      // ★ ここで Rust の API を叩く
-      final uri = Uri.parse('http://127.0.0.1:3000/todos');
-      final res = await http.get(uri);
+      final uri = Uri.parse('$_baseUrl/todos');
+
+      // ★ ここで user_id を取得
+      final userId = await _getOrCreateUserId();
+
+      // ★ x-user-id ヘッダーを付けてGET
+      final res = await http.get(
+        uri,
+        headers: {
+          'x-user-id': userId,
+          'Content-Type': 'application/json', // なくても動くが付けておくと無難
+        },
+      );
 
       if (res.statusCode == 200) {
         final List<dynamic> jsonList = jsonDecode(res.body);
-        final todos = jsonList
-            .map((e) => Todo.fromJson(e as Map<String, dynamic>))
-            .toList();
+        final todos =
+            jsonList
+                .map((e) => Todo.fromJson(e as Map<String, dynamic>))
+                .toList();
 
         setState(() {
           _todos = todos;
@@ -160,14 +226,18 @@ class _TodoPageState extends State<TodoPage> {
     });
 
     try {
-      final uri = Uri.parse('http://127.0.0.1:3000/todos');
+      final uri = Uri.parse('$_baseUrl/todos');
+
+      // ★ user_id を取得
+      final userId = await _getOrCreateUserId();
+
       final res = await http.post(
         uri,
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'title': title,
-          'done': false, // 新規は未完了で作成
-        }),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-id': userId, // ★ ここが重要
+        },
+        body: jsonEncode({'title': title, 'done': false}),
       );
 
       if (res.statusCode == 200 || res.statusCode == 201) {
@@ -176,7 +246,7 @@ class _TodoPageState extends State<TodoPage> {
 
         setState(() {
           _titleController.clear();
-          _todos = [..._todos, newTodo]; // ← ここだけ差分更新！
+          _todos = [..._todos, newTodo];
         });
       } else {
         setState(() {
@@ -187,19 +257,17 @@ class _TodoPageState extends State<TodoPage> {
       setState(() {
         _errorMessage = '通信エラー: $e';
       });
-    } finally {
+    } /*finally {
       setState(() {
         _isLoading = false;
       });
-    }
+    }*/
   }
 
   Future<void> _toggleDone(Todo todo) async {
-    // 1. 対象のindexを探す
     final index = _todos.indexWhere((t) => t.id == todo.id);
     if (index == -1) return;
 
-    // 2. 古い値を控えておく（エラー時に戻す用）
     final old = _todos[index];
     final updated = Todo(id: old.id, title: old.title, done: !old.done);
 
@@ -209,25 +277,27 @@ class _TodoPageState extends State<TodoPage> {
     });
 
     try {
-      final uri = Uri.parse('http://127.0.0.1:3000/todos/${todo.id}');
+      final uri = Uri.parse('$_baseUrl/todos/${todo.id}');
+
+      // ★ user_id を取得
+      final userId = await _getOrCreateUserId();
+
       final res = await http.put(
         uri,
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'done': !todo.done, // ← 反転した値を送る
-        }),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-id': userId, // ★ ここ
+        },
+        body: jsonEncode({'done': !todo.done}),
       );
 
       if (res.statusCode != 200) {
-        // サーバ側でダメだった → 元に戻す
         setState(() {
           _todos[index] = old;
           _errorMessage = '更新に失敗しました: ${res.statusCode}';
         });
       }
-      // 成功なら特に何もしない（もうUIは最新）
     } catch (e) {
-      // 通信エラー → 元に戻す
       setState(() {
         _todos[index] = old;
         _errorMessage = '通信エラー: $e';
@@ -241,15 +311,25 @@ class _TodoPageState extends State<TodoPage> {
 
     final oldList = List<Todo>.from(_todos);
 
-    // 先にUIから消してしまう
     setState(() {
       _todos.removeAt(index);
       _errorMessage = null;
+      //_isLoading = true;
     });
 
     try {
-      final uri = Uri.parse('http://127.0.0.1:3000/todos/${todo.id}');
-      final res = await http.delete(uri);
+      final uri = Uri.parse('$_baseUrl/todos/${todo.id}');
+
+      // ★ user_id を取得
+      final userId = await _getOrCreateUserId();
+
+      final res = await http.delete(
+        uri,
+        headers: {
+          'x-user-id': userId, // ★ DELETE でも同じ
+          'Content-Type': 'application/json',
+        },
+      );
 
       if (res.statusCode != 200) {
         setState(() {
@@ -259,13 +339,14 @@ class _TodoPageState extends State<TodoPage> {
       }
     } catch (e) {
       setState(() {
+        _todos = oldList;
         _errorMessage = '通信エラー: $e';
       });
-    } finally {
+    } /*finally {
       setState(() {
         _isLoading = false;
       });
-    }
+    }*/
   }
 
   // ---- 8. 未来感UIの build ----
@@ -289,12 +370,12 @@ class _TodoPageState extends State<TodoPage> {
             ),
           ],
         ),
-        actions: [
+        /*actions: [
           IconButton(
             icon: const Icon(Icons.refresh),
             onPressed: _isLoading ? null : _fetchTodos,
           ),
-        ],
+        ],*/
       ),
       body: Stack(
         children: [
@@ -335,21 +416,22 @@ class _TodoPageState extends State<TodoPage> {
         ],
       ),
       // ★ 画面下にバナー広告を固定表示（Webのときはnull）
-      bottomNavigationBar: (kIsWeb || _bannerAd == null)
-          ? null
-          : SafeArea(
-              child: SizedBox(
-                height: _bannerAd!.size.height.toDouble(),
-                child: AdWidget(ad: _bannerAd!),
+      bottomNavigationBar:
+          (kIsWeb || _bannerAd == null)
+              ? null
+              : SafeArea(
+                child: SizedBox(
+                  height: _bannerAd!.size.height.toDouble(),
+                  child: AdWidget(ad: _bannerAd!),
+                ),
               ),
-            ),
     );
   }
 
   // ---- 9. 入力エリアカード ----
   Widget _buildInputCard(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       decoration: BoxDecoration(
         // ★ 濃いめブルーグレーのガラス感
         gradient: LinearGradient(
@@ -360,7 +442,7 @@ class _TodoPageState extends State<TodoPage> {
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         ),
-        borderRadius: BorderRadius.circular(20),
+        borderRadius: BorderRadius.circular(14),
         border: Border.all(
           color: Colors.white.withValues(alpha: 0.35),
           width: 1.4,
@@ -380,6 +462,7 @@ class _TodoPageState extends State<TodoPage> {
             child: TextField(
               controller: _titleController,
               style: const TextStyle(color: Colors.white),
+              cursorColor: Colors.white,
               decoration: const InputDecoration(
                 hintText: 'New Todo',
                 hintStyle: TextStyle(color: Colors.white70),
@@ -427,9 +510,10 @@ class _TodoPageState extends State<TodoPage> {
 
   Widget _buildTodoTile(Todo todo) {
     // ベースになる色（未完了・完了で少し変える）
-    final baseColor = todo.done
-        ? const Color.fromARGB(255, 30, 148, 79) // 完了
-        : const Color(0xFF1ABC9C); // 未完了
+    final baseColor =
+        todo.done
+            ? const Color.fromARGB(255, 30, 148, 79) // 完了
+            : const Color(0xFF1ABC9C); // 未完了
 
     return GestureDetector(
       onTap: () => _toggleDone(todo),
@@ -456,9 +540,15 @@ class _TodoPageState extends State<TodoPage> {
         ),
         child: Container(
           // ★ 内側コンテナ：ガラス板そのもの
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          //padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+          padding: const EdgeInsets.only(
+            left: 12,
+            right: 4, // ← ここを 16 → 6 くらいにする
+            top: 3,
+            bottom: 3,
+          ),
           decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(24),
+            borderRadius: BorderRadius.circular(12),
             // 透け感のあるグラデーションでガラスっぽく
             gradient: LinearGradient(
               colors: [
@@ -478,21 +568,21 @@ class _TodoPageState extends State<TodoPage> {
             children: [
               // 左の丸いチェック
               Container(
-                width: 24,
-                height: 24,
+                width: 22,
+                height: 22,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   border: Border.all(
                     color: Colors.white.withValues(alpha: 0.9),
                     width: 2.4,
                   ),
-                  color: todo.done
-                      ? Colors.white.withValues(alpha: 0.95)
-                      : null,
+                  color:
+                      todo.done ? Colors.white.withValues(alpha: 0.95) : null,
                 ),
-                child: todo.done
-                    ? const Icon(Icons.check, size: 16, color: Colors.green)
-                    : null,
+                child:
+                    todo.done
+                        ? const Icon(Icons.check, size: 16, color: Colors.green)
+                        : null,
               ),
               const SizedBox(width: 12),
               // タイトル
@@ -502,12 +592,14 @@ class _TodoPageState extends State<TodoPage> {
                   style: TextStyle(
                     fontSize: 16,
                     fontWeight: FontWeight.w600,
-                    decoration: todo.done
-                        ? TextDecoration.lineThrough
-                        : TextDecoration.none,
-                    color: todo.done
-                        ? Colors.black.withValues(alpha: 0.87)
-                        : Colors.white,
+                    decoration:
+                        todo.done
+                            ? TextDecoration.lineThrough
+                            : TextDecoration.none,
+                    color:
+                        todo.done
+                            ? Colors.black.withValues(alpha: 0.87)
+                            : Colors.white,
                   ),
                 ),
               ),
