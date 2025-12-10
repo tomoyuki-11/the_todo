@@ -1,8 +1,8 @@
 use axum::extract::Path;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, request::Parts};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{FromRequestParts, State},
     routing::{get, put},
 };
 use mongodb::{
@@ -10,6 +10,7 @@ use mongodb::{
     bson::{doc, oid::ObjectId},
 };
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
@@ -18,6 +19,7 @@ use tower_http::cors::{Any, CorsLayer};
 struct Todo {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     id: Option<ObjectId>,
+    user_id: String,
     title: String,
     done: bool,
 }
@@ -37,11 +39,35 @@ struct UpdateTodoPayload {
     done: bool,
 }
 
+struct CurrentUserId(String);
+
+impl<S> FromRequestParts<S> for CurrentUserId
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, String);
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let user_id = parts
+            .headers
+            .get("x-user-id")
+            .and_then(|v| v.to_str().ok())
+            .ok_or((
+                StatusCode::UNAUTHORIZED,
+                "x-user-id header is required".to_string(),
+            ))?;
+        Ok(CurrentUserId(user_id.to_string()))
+    }
+}
+
 // GET /todos
-async fn get_todos(State(state): State<AppState>) -> Json<Vec<Todo>> {
+async fn get_todos(
+    State(state): State<AppState>,
+    CurrentUserId(user_id): CurrentUserId,
+) -> Json<Vec<Todo>> {
     let mut cursor = state
         .collection
-        .find(doc! {}) // 全件取得
+        .find(doc! {"user_id": &user_id}) // 全件取得
         .await
         .expect("Failed to find todos");
 
@@ -58,10 +84,15 @@ async fn get_todos(State(state): State<AppState>) -> Json<Vec<Todo>> {
 }
 
 // POST /todos
-async fn create_todo(State(state): State<AppState>, Json(payload): Json<NewTodo>) -> Json<Todo> {
+async fn create_todo(
+    State(state): State<AppState>,
+    CurrentUserId(user_id): CurrentUserId,
+    Json(payload): Json<NewTodo>,
+) -> Json<Todo> {
     // まず id なしの Todo を作る
     let todo_without_id = Todo {
         id: None,
+        user_id,
         title: payload.title,
         done: false,
     };
@@ -91,6 +122,7 @@ async fn create_todo(State(state): State<AppState>, Json(payload): Json<NewTodo>
 // PUT /todos/:id  （完了フラグの更新）
 async fn update_todo(
     State(state): State<AppState>,
+    CurrentUserId(user_id): CurrentUserId,
     Path(id): Path<String>,
     Json(payload): Json<UpdateTodoPayload>,
 ) -> StatusCode {
@@ -99,7 +131,7 @@ async fn update_todo(
         return StatusCode::BAD_REQUEST;
     };
 
-    let filter = doc! { "_id": oid };
+    let filter = doc! { "_id": oid, "user_id": &user_id };
     let update = doc! { "$set": { "done": payload.done } };
 
     match state.collection.update_one(filter, update).await {
@@ -110,12 +142,16 @@ async fn update_todo(
 }
 
 // DELETE /todos/:id
-async fn delete_todo(State(state): State<AppState>, Path(id): Path<String>) -> StatusCode {
+async fn delete_todo(
+    State(state): State<AppState>,
+    CurrentUserId(user_id): CurrentUserId,
+    Path(id): Path<String>,
+) -> StatusCode {
     let Ok(oid) = ObjectId::parse_str(&id) else {
         return StatusCode::BAD_REQUEST;
     };
 
-    let filter = doc! { "_id": oid };
+    let filter = doc! { "_id": oid, "user_id": &user_id };
 
     match state.collection.delete_one(filter).await {
         Ok(result) if result.deleted_count == 1 => StatusCode::OK,
@@ -126,31 +162,46 @@ async fn delete_todo(State(state): State<AppState>, Path(id): Path<String>) -> S
 
 #[tokio::main]
 async fn main() {
-    // MongoDB に接続
-    let client = Client::with_uri_str("mongodb://localhost:27017")
+    let _ = dotenvy::dotenv();
+    // --- ① 設定を環境変数から読む -----------------------------------
+    let mongodb_uri =
+        env::var("MONGODB_URI").unwrap_or_else(|_| "mongodb://localhost:27017".to_string());
+    // なぜ？ → ローカルでは今まで通り localhost、AWS / Docker では別の URI を渡せるようにするため
+
+    let db_name = env::var("MONGODB_DB").unwrap_or_else(|_| "the_todo_app".to_string());
+    // なぜ？ → 本番だけ DB 名を変えたい時にもコードを書き換えずに済む
+
+    let port: u16 = env::var("PORT")
+        .unwrap_or_else(|_| "3000".to_string())
+        .parse()
+        .expect("PORT must be a number");
+    // なぜ？ → Heroku / Render / ECS などは PORT を環境変数で指定してくるパターンが多いから
+
+    // --- ② MongoDB に接続 ---------------------------------------------
+    let client = Client::with_uri_str(&mongodb_uri)
         .await
         .expect("Failed to connect to MongoDB");
 
-    let db = client.database("the_todo_app");
+    let db = client.database(&db_name);
     let collection = db.collection::<Todo>("todos");
 
     let state = AppState { collection };
 
-    // CORS 設定（全部許可：開発用）
+    // --- ③ CORS（開発中なので全部許可のままで OK） -------------------------
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // ルーター定義
+    // --- ④ ルーター定義 -------------------------------------------------
     let app = Router::new()
         .route("/todos", get(get_todos).post(create_todo))
         .route("/todos/{id}", put(update_todo).delete(delete_todo))
         .with_state(state)
         .layer(cors);
 
-    // サーバー起動
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000)); // ★ ここを変更
+    // --- ⑤ サーバ起動 ---------------------------------------------------
+    let addr = SocketAddr::from(([0, 0, 0, 0], port)); // ★ ここを変更
     println!("Listening on {}", addr);
 
     axum::serve(

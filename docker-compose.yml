@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  api:
+    build: ./backend
+    environment:
+      - MONGODB_URI=mongodb://mongo:27017
+      - MONGODB_DB=the_todo_app
+      - PORT=3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - mongo
+
+  mongo:
+    image: mongo:7
+    restart: always
+    volumes:
+      - mongo_data:/data/db
+
+volumes:
+  mongo_data:
